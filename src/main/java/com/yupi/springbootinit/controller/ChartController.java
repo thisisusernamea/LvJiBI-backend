@@ -1,29 +1,26 @@
 package com.yupi.springbootinit.controller;
 
-import cn.hutool.http.HttpRequest;
-import cn.hutool.json.JSONUtil;
+import cn.hutool.core.io.FileUtil;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.yupi.springbootinit.annotation.AuthCheck;
 import com.yupi.springbootinit.common.BaseResponse;
 import com.yupi.springbootinit.common.DeleteRequest;
 import com.yupi.springbootinit.common.ErrorCode;
 import com.yupi.springbootinit.common.ResultUtils;
-import com.yupi.springbootinit.constant.FileConstant;
 import com.yupi.springbootinit.constant.UserConstant;
 import com.yupi.springbootinit.exception.BusinessException;
 import com.yupi.springbootinit.exception.ThrowUtils;
 import com.yupi.springbootinit.manager.AIManager;
+import com.yupi.springbootinit.manager.RedisLimiterManager;
+import com.yupi.springbootinit.mapper.ChartMapper;
 import com.yupi.springbootinit.model.dto.chart.*;
-import com.yupi.springbootinit.model.dto.file.UploadFileRequest;
 import com.yupi.springbootinit.model.entity.Chart;
 import com.yupi.springbootinit.model.entity.User;
-import com.yupi.springbootinit.model.enums.FileUploadBizEnum;
 import com.yupi.springbootinit.model.vo.BIResponse;
 import com.yupi.springbootinit.service.ChartService;
 import com.yupi.springbootinit.service.UserService;
 import com.yupi.springbootinit.utils.ExcelUtils;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.commons.lang3.RandomStringUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.springframework.beans.BeanUtils;
 import org.springframework.web.bind.annotation.*;
@@ -31,7 +28,7 @@ import org.springframework.web.multipart.MultipartFile;
 
 import javax.annotation.Resource;
 import javax.servlet.http.HttpServletRequest;
-import java.io.File;
+import java.util.Arrays;
 import java.util.List;
 
 /**
@@ -53,6 +50,12 @@ public class ChartController {
 
     @Resource
     private AIManager aiManager;
+
+    @Resource
+    private RedisLimiterManager redisLimiterManager;
+
+    @Resource
+    private ChartMapper chartMapper;
 
     // region 增删改查
 
@@ -235,7 +238,16 @@ public class ChartController {
         //校验
         ThrowUtils.throwIf(StringUtils.isBlank(goal),ErrorCode.PARAMS_ERROR,"分析目标为空");
         ThrowUtils.throwIf(StringUtils.isNotBlank(name) && name.length() > 100,ErrorCode.PARAMS_ERROR,"图表名称过长");
-
+        //校验文件大小
+        final long ONE_MB = 1024 * 1024L;
+        ThrowUtils.throwIf(multipartFile.getSize() > ONE_MB,ErrorCode.PARAMS_ERROR,"文件超过 1M");
+        //校验文件后缀
+        String originalFilename = multipartFile.getOriginalFilename();
+        String suffix = FileUtil.getSuffix(originalFilename);
+        final List<String> validFileSuffix = Arrays.asList("png", "jpg", "svg", "webp", "jpeg","xlsx");
+        ThrowUtils.throwIf(!validFileSuffix.contains(suffix),ErrorCode.SYSTEM_ERROR,"文件后缀不合法");
+        //限流判断,每个用户一个限流器
+        redisLimiterManager.doRateLimit("genChartByAi_" + loginUser.getId());
         /**
          * 处理用户传来的数据(构造用户输入):将系统预设 + 分析需求 + 原始 excel 类型数据,进行拼接
          */
@@ -274,6 +286,15 @@ public class ChartController {
         boolean saveResult = chartService.save(chart);
         ThrowUtils.throwIf(!saveResult,ErrorCode.SYSTEM_ERROR,"图表保存失败");
         /**
+         * 创建excel原始数据对应的数据库表
+         */
+       /* String charId = chart.getId().toString();
+        try {
+            chartMapper.createTableByChartId(charId,ExcelUtils.getExcelHeader(multipartFile));
+        } catch (Exception e) {
+            log.error("建表失败",e);
+        }*/
+        /**
          * 响应
          */
         BIResponse biResponse = new BIResponse();
@@ -282,5 +303,4 @@ public class ChartController {
         biResponse.setChartId(chart.getId());
         return ResultUtils.success(biResponse);
     }
-
 }

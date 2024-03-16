@@ -23,4 +23,23 @@
         chartType,genChart,genResult,userId,
         createTime,updateTime,isDelete
     </sql>
+
+    <!-- int createTableByChartId(@Param("chartId")String chartId, @Param("columnList")List<String> columnList); -->
+    <update id="createTableByChartId" parameterType="String">
+        create table chart_${chartId} if not exists(
+            id bigint auto_increment comment 'id'
+                primary key,
+            <foreach collection="columnList" item="columnName" separator=",">
+                ${columnName} varchar(255) null
+            </foreach>
+        )
+    </update>
+
+    <!-- int insertExcelDataToTable(@Param("chartId")String chartId, @Param("dataList")List<String> dataList); -->
+    <!--<insert id="insertExcelDataToTable" parameterType="String" >
+        insert into chart_${chartId} values
+            <foreach collection="dataList" item="data" separator=",">
+                ()
+            </foreach>
+    </insert>-->
 </mapper>
