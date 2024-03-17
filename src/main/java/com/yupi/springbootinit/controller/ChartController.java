@@ -16,6 +16,7 @@ import com.yupi.springbootinit.mapper.ChartMapper;
 import com.yupi.springbootinit.model.dto.chart.*;
 import com.yupi.springbootinit.model.entity.Chart;
 import com.yupi.springbootinit.model.entity.User;
+import com.yupi.springbootinit.model.enums.ChartStatusEnum;
 import com.yupi.springbootinit.model.vo.BIResponse;
 import com.yupi.springbootinit.service.ChartService;
 import com.yupi.springbootinit.service.UserService;
@@ -30,6 +31,8 @@ import javax.annotation.Resource;
 import javax.servlet.http.HttpServletRequest;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ThreadPoolExecutor;
 
 /**
  * 图表信息接口
@@ -56,6 +59,9 @@ public class ChartController {
 
     @Resource
     private ChartMapper chartMapper;
+
+    @Resource
+    private ThreadPoolExecutor threadPoolExecutor;
 
     // region 增删改查
 
@@ -220,7 +226,7 @@ public class ChartController {
     }
 
     /**
-     * （根据用户输入）智能分析
+     * 同步智能分析
      *
      * @param multipartFile
      * @param genChartByAiRequest
@@ -244,7 +250,7 @@ public class ChartController {
         //校验文件后缀
         String originalFilename = multipartFile.getOriginalFilename();
         String suffix = FileUtil.getSuffix(originalFilename);
-        final List<String> validFileSuffix = Arrays.asList("png", "jpg", "svg", "webp", "jpeg","xlsx");
+        final List<String> validFileSuffix = Arrays.asList("xls","xlsx");
         ThrowUtils.throwIf(!validFileSuffix.contains(suffix),ErrorCode.SYSTEM_ERROR,"文件后缀不合法");
         //限流判断,每个用户一个限流器
         redisLimiterManager.doRateLimit("genChartByAi_" + loginUser.getId());
@@ -265,6 +271,7 @@ public class ChartController {
         String cvsData = ExcelUtils.excelToCvs(multipartFile);
         userInput.append("原始数据：").append("\n");
         userInput.append(cvsData).append("\n");
+        //调用 AI
         String result = aiManager.doChat(modelId, userInput.toString());
         String[] splits = result.split("【【【【【");
         if(splits.length < 3){
@@ -302,5 +309,120 @@ public class ChartController {
         biResponse.setGenResult(genResult);
         biResponse.setChartId(chart.getId());
         return ResultUtils.success(biResponse);
+    }
+
+    /**
+     * 异步智能分析
+     *
+     * @param multipartFile
+     * @param genChartByAiRequest
+     * @param request
+     * @return
+     */
+    @PostMapping("/gen/async")
+    public BaseResponse<BIResponse> genChartByAiAsync(@RequestPart("file") MultipartFile multipartFile,
+                                                 GenChartByAiRequest genChartByAiRequest, HttpServletRequest request) {
+        User loginUser = userService.getLoginUser(request);
+        ThrowUtils.throwIf(genChartByAiRequest == null,ErrorCode.PARAMS_ERROR);
+        String name = genChartByAiRequest.getName();
+        String goal = genChartByAiRequest.getGoal();
+        String chartType = genChartByAiRequest.getChartType();
+        //校验
+        ThrowUtils.throwIf(StringUtils.isBlank(goal),ErrorCode.PARAMS_ERROR,"分析目标为空");
+        ThrowUtils.throwIf(StringUtils.isNotBlank(name) && name.length() > 100,ErrorCode.PARAMS_ERROR,"图表名称过长");
+        //校验文件大小
+        final long ONE_MB = 1024 * 1024L;
+        ThrowUtils.throwIf(multipartFile.getSize() > ONE_MB,ErrorCode.PARAMS_ERROR,"文件超过 1M");
+        //校验文件后缀
+        String originalFilename = multipartFile.getOriginalFilename();
+        String suffix = FileUtil.getSuffix(originalFilename);
+        final List<String> validFileSuffix = Arrays.asList("xls","xlsx");
+        ThrowUtils.throwIf(!validFileSuffix.contains(suffix),ErrorCode.SYSTEM_ERROR,"文件后缀不合法");
+        //限流判断,每个用户一个限流器
+        redisLimiterManager.doRateLimit("genChartByAi_" + loginUser.getId());
+        /**
+         * 处理用户传来的数据(构造用户输入):将系统预设 + 分析需求 + 原始 excel 类型数据,进行拼接
+         */
+        //系统预设:使用鱼聪明系统预设模型
+        final long modelId = 1759424033143119874L;
+        StringBuilder userInput = new StringBuilder();
+        //分析需求:分析目标 + 图表类型
+        userInput.append("分析需求：").append("\n");
+        String userDemand = goal;
+        if(StringUtils.isNotBlank(chartType)){
+            userDemand += ",请使用" + chartType;
+        }
+        userInput.append(userDemand).append("\n");
+        //excel数据转cvs文本
+        String cvsData = ExcelUtils.excelToCvs(multipartFile);
+        userInput.append("原始数据：").append("\n");
+        userInput.append(cvsData).append("\n");
+        /**
+         * 将生成的图表插入到图表信息表,保存任务
+         */
+        Chart chart = new Chart();
+        chart.setName(name);
+        chart.setGoal(goal);
+        chart.setChartData(cvsData);
+        chart.setChartType(chartType);
+        chart.setStatus(ChartStatusEnum.WAIT.getStatusCode());
+        chart.setUserId(loginUser.getId());
+        boolean saveResult = chartService.save(chart);
+        ThrowUtils.throwIf(!saveResult,ErrorCode.SYSTEM_ERROR,"图表保存失败");
+        /**
+         * 任务提交到线程池异步处理
+         */
+        CompletableFuture.runAsync(() -> {
+            //修改任务执行状态为 “进行中”
+            Chart updateChart = new Chart();
+            updateChart.setId(chart.getId());
+            updateChart.setStatus(ChartStatusEnum.RUNNING.getStatusCode());
+            boolean updateResult = chartService.updateById(updateChart);
+            if(!updateResult){
+                handleChartUpdateError(chart.getId(),"更新图表执行中状态失败");
+            }
+            /**
+             * 调用 AI
+             */
+            String result = aiManager.doChat(modelId, userInput.toString());
+            String[] splits = result.split("【【【【【");
+            if(splits.length < 3){
+                throw new BusinessException(ErrorCode.SYSTEM_ERROR,"AI 生成错误");
+            }
+            //修改任务执行状态为 “已完成”,，并保存 AI 生成的执行结果
+            String genChart = splits[1].trim();
+            String genResult = splits[2].trim();
+            Chart updateChartResult = new Chart();
+            updateChartResult.setId(chart.getId());
+            updateChartResult.setGenChart(genChart);
+            updateChartResult.setGenResult(genResult);
+            updateChartResult.setStatus(ChartStatusEnum.SUCCEED.getStatusCode());
+            boolean updateResultFinal = chartService.updateById(updateChartResult);
+            if(!updateResultFinal){
+                handleChartUpdateError(chart.getId(),"更新图表执行中状态失败");
+            }
+        },threadPoolExecutor);
+        /**
+         * 响应
+         */
+        BIResponse biResponse = new BIResponse();
+        biResponse.setChartId(chart.getId());
+        return ResultUtils.success(biResponse);
+    }
+
+    /**
+     * 任务执行失败,修改任务执行状态为 "失败",并记录任务执行失败信息
+     * @param chartId
+     * @param execMsg
+     */
+    public void handleChartUpdateError(long chartId,String execMsg){
+        Chart updateChartResult = new Chart();
+        updateChartResult.setId(chartId);
+        updateChartResult.setStatus(ChartStatusEnum.FAILED.getStatusCode());
+        updateChartResult.setExecMsg(execMsg);
+        boolean updateResult = chartService.updateById(updateChartResult);
+        if(!updateResult){
+            log.error(chartId + "," + execMsg);
+        }
     }
 }

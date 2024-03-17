@@ -21,9 +21,10 @@ public class RedisLimiterManager {
 
     /**
      * 限流操作
+     * @param key 限流器
      */
     public void doRateLimit(String key){
-        //为每个用户创建一个限流器,每个每秒最多访问 2 次
+        //为每个用户创建一个限流器,每个用户每秒最多访问 2 次
         RRateLimiter rateLimiter = redissonClient.getRateLimiter(key);
         rateLimiter.trySetRate(RateType.OVERALL,2,1, RateIntervalUnit.SECONDS);
         //每当一个操作来了后,请求一个令牌
